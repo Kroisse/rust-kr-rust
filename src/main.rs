@@ -4,18 +4,27 @@ extern crate rustc_serialize;
 extern crate mustache;
 extern crate getopts;
 extern crate mime;
-extern crate hyper;
+extern crate iron;
+extern crate mount;
+extern crate persistent;
 extern crate pulldown_cmark;
+#[macro_use] extern crate router;
+extern crate staticfile;
+extern crate typemap;
 
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::net::Ipv4Addr;
+use std::fmt;
 use std::fs::File;
 use std::fs::read_dir;
 use std::path::Path;
-use hyper::Get;
-use hyper::header::{ContentLength, ContentType};
-use hyper::server::{Server, Handler, Request, Response, Fresh};
-use hyper::uri::RequestUri::AbsolutePath;
+use iron::headers::{ContentLength, ContentType};
+use iron::prelude::*;
+use iron::status;
+use mount::Mount;
+use router::Router;
+use staticfile::Static;
+use typemap::Key;
 
 use compat::PathExt;
 
@@ -31,6 +40,39 @@ macro_rules! try_return {
     }}
 }
 
+// workaround (because mustache::Error doesn't implement std::error::Error
+#[derive(Debug)]
+struct TemplateError(mustache::Error);
+
+impl fmt::Display for TemplateError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+impl ::std::error::Error for TemplateError {
+    fn description(&self) -> &str {
+        use mustache::Error::*;
+        match self.0 {
+            NestedOptions => "Nested options",
+            UnsupportedType => "Unsupported type",
+            InvalidStr => "Invalid str",
+            MissingElements => "Missing elements",
+            KeyIsNotString => "Key is not a string",
+            NoFilename => "No filename",
+            IoError(ref e) => e.description(),
+        }
+    }
+
+    fn cause(&self) -> Option<&::std::error::Error> {
+        use mustache::Error::*;
+        match self.0 {
+            IoError(ref e) => Some(e),
+            _ => None
+        }
+    }
+}
+
 #[derive(RustcEncodable)]
 struct Ctx {
     content: String,
@@ -38,51 +80,17 @@ struct Ctx {
 }
 
 #[derive(Clone)]
-struct RustKrServer {
+struct RustKrConfig {
     port: u16,
     doc_dir: String,
-    static_dir: String,
     template: mustache::Template,
 }
 
-impl Handler for RustKrServer {
-    fn handle<'a, 'k>(&'a self, req: Request<'a, 'k>, res: Response<'a, Fresh>) {
-        if req.method == Get {
-            let uri = req.uri.clone();
-            if let AbsolutePath(ref uri) = uri {
-                macro_rules! handlers {
-                    (
-                        $(
-                            ($path:expr, $handler:ident),
-                        )+
-                    ) => (
-                        {
-                            $(
-                                if uri.starts_with($path) {
-                                    let remaining = &uri[$path.len()..];
-                                    self.$handler(remaining, req, res);
-                                    return;
-                                }
-                            )+
-                        }
-                    )
-                }
-
-                handlers!(
-                    ("/static/", handle_static_file),
-                    ("/pages/", handle_page),
-                    ("/", handle_index_page),
-                );
-            }
-        }
-
-        // fallthrough
-        self.show_bad_request(req, res);
-        return;
-    }
+impl Key for RustKrConfig {
+    type Value = RustKrConfig;
 }
 
-impl RustKrServer {
+impl RustKrConfig {
     fn is_bad_title(&self, title: &str) -> bool {
         for c in title.chars() {
             match c {
@@ -107,12 +115,12 @@ impl RustKrServer {
     pub fn list_pages(&self) -> String {
         let dir = Path::new(&self.doc_dir);
         if !dir.exists() {
-            return "No pages found".to_string();
+            return "No pages found".to_owned();
         }
 
         let files = match read_dir(&dir) {
             Ok(files) => files,
-            Err(_) => return "Error during reading dir".to_string(),
+            Err(_) => return "Error during reading dir".to_owned(),
         };
         let mut pages = vec![];
         for file in files {
@@ -149,116 +157,88 @@ impl RustKrServer {
         pages.sort();
 
         if pages.len() > 0 {
-            let mut ret = "<ul>\n".to_string();
+            let mut ret = "<ul>\n".to_owned();
             for page in pages.iter() {
                 ret = ret + &format!(r#"<li><a href="/pages/{}">{}</a></li>"#, *page, *page);
             }
             ret = ret + "</ul>";
             ret
         } else {
-            "No pages found".to_string()
+            "No pages found".to_owned()
         }
     }
 
-    fn show_not_found(&self, req: Request, res: Response) {
+    fn show_not_found(&self, _req: &mut Request) -> IronResult<Response> {
         let ctx = Ctx {
-            title: "Not Found".to_string(),
-            content: "헐".to_string(),
+            title: "Not Found".to_owned(),
+            content: "헐".to_owned(),
         };
-        self.show_template(req, res, &ctx);
+        self.show_template(&ctx).map(|res| res.set(status::NotFound))
     }
 
-    fn show_bad_request(&self, req: Request, res: Response) {
+    fn show_bad_request(&self, _req: &mut Request) -> IronResult<Response> {
         let ctx = Ctx {
-            title: "Bad request".to_string(),
-            content: "헐".to_string(),
+            title: "Bad request".to_owned(),
+            content: "헐".to_owned(),
         };
-        self.show_template(req, res, &ctx);
+        self.show_template(&ctx).map(|res| res.set(status::BadRequest))
     }
 
-    fn show_template(&self, _: Request, mut res: Response, ctx: &Ctx) {
+    fn show_template(&self, ctx: &Ctx) -> IronResult<Response> {
         let mut output = vec![];
         match self.template.render(&mut output, ctx) {
             Ok(()) => {}
-            Err(_) => return,
+            Err(e) => return Err(IronError::new(TemplateError(e), &*output))
         }
 
+        let mut res = Response::with(&*output).set(status::Ok);
+
         {
-            let headers = res.headers_mut();
+            let headers = &mut res.headers;
 
             headers.set(ContentLength(output.len() as u64));
             let content_type = mime::Mime(mime::TopLevel::Text, mime::SubLevel::Html, vec![]);
             headers.set(ContentType(content_type));
         }
 
-        let mut res = try_return!(res.start());
-        try_return!(res.write_all(&output));
-        try_return!(res.end());
+        Ok(res)
     }
+}
 
-    fn handle_index_page(&self, remaining: &str, req: Request, res: Response) {
-        if remaining.len() > 0 {
-            self.show_not_found(req, res);
-            return;
-        }
-        self.handle_page("index", req, res);
-    }
+fn handle_index_page(req: &mut Request) -> IronResult<Response> {
+    render_page(req, "index")
+}
 
-    fn handle_page(&self, title: &str, req: Request, res: Response) {
-        debug!("handle page: {}", title);
-        let (title, content) = match title {
-            "_pages" => ("모든 문서", self.list_pages()),
-            _ => {
-                let content = self.read_page(title);
-                match content.ok() {
-                    Some(content) => (title, content),
-                    None => {
-                        return self.show_not_found(req, res);
-                    }
-                }
-            }
-        };
-        let ctx = Ctx {
-            title: title.to_string(),
+fn handle_page(req: &mut Request) -> IronResult<Response> {
+    let title = {
+        let params = req.extensions.get::<Router>().unwrap();
+        params.find("title").unwrap().to_owned()
+    };
+    render_page(req, &title)
+}
+
+fn handle_list_pages(req: &mut Request) -> IronResult<Response> {
+    let rskr = req.get_ref::<persistent::Read<RustKrConfig>>().unwrap();
+    let ctx = Ctx {
+        title: "모든 문서".to_owned(),
+        content: rskr.list_pages(),
+    };
+    rskr.show_template(&ctx)
+}
+
+fn render_page(req: &mut Request, title: &str) -> IronResult<Response> {
+    let rskr = req.get::<persistent::Read<RustKrConfig>>().unwrap();
+    let content = rskr.read_page(title);
+    let ctx = match content.ok() {
+        Some(content) => Ctx {
+            title: title.to_owned(),
             content: content,
-        };
-        self.show_template(req, res, &ctx);
-    }
-
-    fn handle_static_file(&self, loc: &str, req: Request, mut res: Response) {
-        let path = format!("{}/{}", self.static_dir, loc);
-        let path = Path::new(&path);
-        if !path.exists() {
-            self.show_not_found(req, res);
-            return;
+        },
+        None => {
+            return rskr.show_not_found(req);
         }
-        let mut f = try_return!(File::open(&path));
-        let mut output = Vec::new();
-        try_return!(f.read_to_end(&mut output));
-
-        {
-            let headers = res.headers_mut();
-
-            headers.set(ContentLength(output.len() as u64));
-
-            let mut subtype = mime::SubLevel::Plain;
-            match path.extension() {
-                Some(ext) => {
-                    match ext.to_str() {
-                        Some("css") => subtype = mime::SubLevel::Css,
-                        _ => (),
-                    }
-                }
-                _ => (),
-            }
-            let params = vec![(mime::Attr::Charset, mime::Value::Utf8)];
-            headers.set(ContentType(mime::Mime(mime::TopLevel::Text, subtype, params)));
-        }
-
-        let mut res = try_return!(res.start());
-        try_return!(res.write_all(&output));
-        try_return!(res.end());
-    }
+    };
+    rskr.show_template(&ctx)
 }
 
 fn main() {
@@ -278,22 +258,35 @@ fn main() {
     let static_dir = matches.opt_str("static").unwrap_or("static".to_string());
     let template_path = matches.opt_str("template")
                                .unwrap_or("templates/default.mustache".to_string());
-    let num_threads = matches.opt_str("num-threads").unwrap_or("10".to_string()).parse().unwrap();
 
-    debug!("port: {} / doc_dir: {} / static_dir: {} / template_path: {} / num_threads: {}",
-           port, doc_dir, static_dir, template_path, num_threads);
+    debug!("port: {} / doc_dir: {} / static_dir: {} / template_path: {}",
+           port, doc_dir, static_dir, template_path);
 
     let template = mustache::compile_path(Path::new(&template_path)).unwrap();
 
-    let rskr = RustKrServer {
+    let rskr = RustKrConfig {
         port: port,
         doc_dir: doc_dir,
-        static_dir: static_dir,
         template: template,
     };
 
+    let mut handler = Chain::new({
+        let mut mount = Mount::new();
+        mount.mount("/static", Static::new(Path::new(&static_dir)));
+        mount.mount("/", router!(
+            get "/"       => handle_index_page,
+            get "/pages"  => handle_list_pages,
+            get "/pages/_pages"  => handle_list_pages,  // legacy
+            get "/pages/:title" => handle_page
+        ));
+        mount
+    });
+
+    handler.link(persistent::Read::<RustKrConfig>::both(rskr));
+
+    let server = Iron::new(handler);
+
     let addr = (Ipv4Addr::new(127, 0, 0, 1), port);
-    let server = Server::http(addr).unwrap();
-    server.handle_threads(rskr, num_threads).unwrap();
+    server.http(addr).unwrap();
     debug!("listening...");
 }
