@@ -1,8 +1,12 @@
+sudo: required
 language: rust
 rust:
   - stable
 cache:
   directories:
     - target/
+before_install:
+  - sudo apt-get install fonts-nanum
+  - fc-cache -fv
 after_success:
   - bash tests/capture_screen.sh

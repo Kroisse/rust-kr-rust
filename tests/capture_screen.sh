@@ -8,7 +8,7 @@ phantomjs tests/capture_screen.js
 
 IMAGE_URL=$(
     curl -X POST -H "Authorization: Client-ID ${IMGUR_CLIENT_ID}" \
-        -F "title=${TRAVIS_BUILD_ID}" \
+        -F "title=Build #${TRAVIS_BUILD_NUMBER}" \
         -F "album=${IMGUR_ALBUM_DELETEHASH}" \
         -F "image=@index.png" \
         https://api.imgur.com/3/image \
