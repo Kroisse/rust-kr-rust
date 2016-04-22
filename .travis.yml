@@ -1,3 +1,6 @@
 language: rust
 rust:
   - stable
+build:
+  after_success:
+    - bash tests/capture_screen.sh
