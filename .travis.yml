@@ -1,6 +1,8 @@
 language: rust
 rust:
   - stable
-build:
-  after_success:
-    - bash tests/capture_screen.sh
+cache:
+  directories:
+    - target/
+after_success:
+  - bash tests/capture_screen.sh
